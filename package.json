@@ -1,0 +1,21 @@
+{
+  "name": "bale-bot-server-uploader",
+  "version": "1.0.0",
+  "description": "Upload server videos and files to Bale Messenger using a bot daemon, CLI, or premium Web Dashboard.",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "bot": "node bot-daemon.js",
+    "cli": "node cli-upload.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "systeminformation": "^5.22.7"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
