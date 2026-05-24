@@ -19,6 +19,19 @@ const passwordInput = document.getElementById("password");
 const loginError = document.getElementById("login-error");
 const logoutBtn = document.getElementById("logout-btn");
 
+// Navigation Tabs
+const tabButtons = document.querySelectorAll(".tab-btn");
+const tabViews = document.querySelectorAll(".tab-content-panel");
+
+// DOM elements for YouTube Search & Download
+const ytSearchInput = document.getElementById("yt-search-input");
+const ytSearchBtn = document.getElementById("yt-search-btn");
+const directDlBar = document.getElementById("direct-dl-bar");
+const directDlVideoBtn = document.getElementById("direct-dl-video");
+const directDlAudioBtn = document.getElementById("direct-dl-audio");
+const ytResultsContainer = document.getElementById("yt-results-container");
+const downloadsQueueList = document.getElementById("downloads-queue-list");
+
 // Status components
 const botPulse = document.getElementById("bot-status-pulse");
 const botStatusText = document.getElementById("bot-status-text");
@@ -85,6 +98,46 @@ document.addEventListener("DOMContentLoaded", () => {
     closeModalBtn.addEventListener("click", hideModal);
     cancelUploadBtn.addEventListener("click", hideModal);
     uploadForm.addEventListener("submit", handleUploadSubmit);
+
+    // Tab switching bindings
+    tabButtons.forEach(btn => {
+        btn.addEventListener("click", () => {
+            const targetTab = btn.getAttribute("data-tab");
+            
+            tabButtons.forEach(b => b.classList.remove("active"));
+            tabViews.forEach(v => v.classList.add("hidden"));
+            
+            btn.classList.add("active");
+            const targetView = document.getElementById(targetTab);
+            if (targetView) {
+                targetView.classList.remove("hidden");
+            }
+            
+            // Refresh content based on tab selection
+            if (targetTab === "files-tab-view") {
+                fetchFiles(currentDir);
+            } else if (targetTab === "youtube-tab-view") {
+                fetchActiveDownloads();
+            }
+        });
+    });
+
+    // YouTube search bindings
+    if (ytSearchBtn) {
+        ytSearchBtn.addEventListener("click", performSearch);
+    }
+    if (ytSearchInput) {
+        ytSearchInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") performSearch();
+        });
+        ytSearchInput.addEventListener("input", handleSearchInput);
+    }
+    if (directDlVideoBtn) {
+        directDlVideoBtn.addEventListener("click", () => triggerDownloadFromInput("video"));
+    }
+    if (directDlAudioBtn) {
+        directDlAudioBtn.addEventListener("click", () => triggerDownloadFromInput("audio"));
+    }
 });
 
 // Format Byte Size
@@ -143,6 +196,8 @@ function showLogin() {
     dashboardContainer.classList.add("hidden");
 }
 
+let downloadsInterval = null;
+
 function showDashboard() {
     loginContainer.classList.add("hidden");
     dashboardContainer.classList.remove("hidden");
@@ -151,10 +206,14 @@ function showDashboard() {
     fetchStatus();
     fetchFiles("");
     fetchLogs();
+    fetchActiveDownloads();
 
     // Set up intervals
     setInterval(fetchStatus, 5000);
     setInterval(fetchLogs, 5000);
+    
+    if (downloadsInterval) clearInterval(downloadsInterval);
+    downloadsInterval = setInterval(fetchActiveDownloads, 2000);
 }
 
 // Authentication handlers
@@ -188,6 +247,9 @@ async function handleLoginSubmit(e) {
 function handleLogout() {
     token = null;
     localStorage.removeItem("dashboard_token");
+    if (downloadsInterval) {
+        clearInterval(downloadsInterval);
+    }
     location.reload();
 }
 
@@ -394,9 +456,19 @@ async function fetchFiles(dir) {
                     openUploadModal(file, isVideo);
                 });
                 actionsTd.appendChild(sendBtn);
-            } else {
-                actionsTd.innerText = "--";
             }
+
+            // Safe Deletion action for files/directories
+            const deleteBtn = document.createElement("button");
+            deleteBtn.className = "btn-action-delete";
+            deleteBtn.title = `Delete ${file.isDir ? 'folder' : 'file'} from server`;
+            deleteBtn.innerHTML = `
+        <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+      `;
+            deleteBtn.addEventListener("click", () => {
+                deleteServerFile(file.relativePath, file.isDir);
+            });
+            actionsTd.appendChild(deleteBtn);
 
             tr.appendChild(nameTd);
             tr.appendChild(sizeTd);
@@ -523,5 +595,229 @@ async function handleUploadSubmit(e) {
     } catch (err) {
         loadingOverlay.classList.add("hidden");
         alert(`❌ Upload Failed: ${err.message}`);
+    }
+}
+
+// Safe File/Folder deletion request
+async function deleteServerFile(relativePath, isDir) {
+    const typeLabel = isDir ? "folder (and all its contents)" : "file";
+    if (!confirm(`Are you sure you want to permanently delete this ${typeLabel} from the server?\n\nPath: ${relativePath}`)) {
+        return;
+    }
+
+    try {
+        const res = await apiFetch("/api/files/delete", {
+            method: "POST",
+            body: JSON.stringify({ relativePath }),
+        });
+
+        const data = await res.json();
+        if (data.success) {
+            fetchFiles(currentDir);
+        } else {
+            alert(`❌ Failed to delete: ${data.error || "Server error occurred"}`);
+        }
+    } catch (err) {
+        alert(`❌ Deletion error: ${err.message}`);
+    }
+}
+
+// YouTube Search & Download logic
+function handleSearchInput() {
+    const val = ytSearchInput.value.trim();
+    if (isYouTubeUrl(val)) {
+        directDlBar.style.display = "flex";
+    } else {
+        directDlBar.style.display = "none";
+    }
+}
+
+function isYouTubeUrl(url) {
+    return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/i.test(url);
+}
+
+function triggerDownloadFromInput(type) {
+    const url = ytSearchInput.value.trim();
+    if (url) {
+        triggerDownload(url, type);
+    }
+}
+
+async function performSearch() {
+    const query = ytSearchInput.value.trim();
+    if (!query) return;
+
+    ytResultsContainer.innerHTML = `
+        <div class="yt-placeholder-message">
+            <div class="spinner"></div>
+            <p>Searching YouTube...</p>
+        </div>
+    `;
+
+    try {
+        const res = await apiFetch(`/api/youtube/search?q=${encodeURIComponent(query)}`);
+        const data = await res.json();
+        renderSearchResults(data);
+    } catch (err) {
+        console.error("Search failed:", err);
+        ytResultsContainer.innerHTML = `
+            <div class="yt-placeholder-message">
+                <p class="error-text" style="margin-top:0">⚠️ Search failed: ${err.message}</p>
+            </div>
+        `;
+    }
+}
+
+function renderSearchResults(data) {
+    ytResultsContainer.innerHTML = "";
+    
+    // Combine video search results
+    if (data.videos && data.videos.length > 0) {
+        data.videos.forEach(video => {
+            const item = document.createElement("div");
+            item.className = "yt-result-item";
+            
+            item.innerHTML = `
+                <div class="yt-thumb-container">
+                    <img class="yt-thumb" src="${video.thumbnail || video.image || 'https://via.placeholder.com/120x80'}" alt="${video.title}" referrerPolicy="no-referrer">
+                    <span class="yt-duration">${video.duration ? video.duration.timestamp : (video.timestamp || '--')}</span>
+                </div>
+                <div class="yt-meta">
+                    <div class="yt-title" title="${video.title}">${video.title}</div>
+                    <div class="yt-channel">${video.author ? video.author.name : ''}</div>
+                    <div class="yt-stats">${video.views ? video.views.toLocaleString() + ' views' : ''}</div>
+                </div>
+                <div class="yt-actions">
+                    <button class="btn-primary dl-video-btn">🎥 Video</button>
+                    <button class="btn-secondary dl-audio-btn">🎵 Audio</button>
+                </div>
+            `;
+            
+            // Bind actions
+            item.querySelector(".dl-video-btn").addEventListener("click", () => triggerDownload(video.url, "video"));
+            item.querySelector(".dl-audio-btn").addEventListener("click", () => triggerDownload(video.url, "audio"));
+            
+            ytResultsContainer.appendChild(item);
+        });
+    } else {
+        ytResultsContainer.innerHTML = `
+            <div class="yt-placeholder-message">
+                <p>No videos found matching your query.</p>
+            </div>
+        `;
+    }
+}
+
+async function triggerDownload(url, type) {
+    try {
+        const res = await apiFetch("/api/youtube/download", {
+            method: "POST",
+            body: JSON.stringify({ url, type }),
+        });
+        
+        const data = await res.json();
+        if (data.success) {
+            // Fetch/refresh queue
+            fetchActiveDownloads();
+            // Clear search input if it was a direct url download
+            if (isYouTubeUrl(ytSearchInput.value.trim())) {
+                ytSearchInput.value = "";
+                directDlBar.style.display = "none";
+            }
+        } else {
+            alert(`❌ Failed to start download: ${data.error || "Server error occurred"}`);
+        }
+    } catch (err) {
+        alert(`❌ Download trigger failed: ${err.message}`);
+    }
+}
+
+async function fetchActiveDownloads() {
+    if (!token) return;
+    try {
+        const res = await apiFetch("/api/youtube/downloads");
+        const data = await res.json();
+        renderQueueList(data.downloads);
+    } catch (err) {
+        console.error("Failed to fetch active downloads:", err);
+    }
+}
+
+function renderQueueList(downloads) {
+    if (!downloads || downloads.length === 0) {
+        downloadsQueueList.innerHTML = `<div class="queue-empty-message">No active downloads.</div>`;
+        return;
+    }
+
+    downloadsQueueList.innerHTML = "";
+    
+    downloads.forEach(job => {
+        const item = document.createElement("div");
+        item.className = `queue-item ${job.status}`;
+        
+        // Status badge styling
+        let badgeClass = "badge-downloading";
+        let badgeText = "Downloading";
+        if (job.status === "completed") {
+            badgeClass = "badge-completed";
+            badgeText = "Completed";
+        } else if (job.status === "failed") {
+            badgeClass = "badge-failed";
+            badgeText = "Failed";
+        }
+        
+        // Footer stats text
+        let statsText = "";
+        if (job.status === "downloading") {
+            statsText = `Speed: ${job.speed} | ETA: ${job.eta}`;
+        } else if (job.status === "completed") {
+            statsText = "Saved on server downloads folder";
+        } else {
+            statsText = "Download failed";
+        }
+        
+        item.innerHTML = `
+            <div class="queue-item-header">
+                <div class="queue-item-title" title="${job.title}">${job.title}</div>
+                <span class="queue-item-badge ${badgeClass}">${badgeText}</span>
+            </div>
+            
+            <div class="queue-progress-row">
+                <div class="queue-progress-bar-container">
+                    <div class="queue-progress-fill" style="width: ${job.progress}%"></div>
+                </div>
+                <span>${job.progress.toFixed(1)}%</span>
+            </div>
+            
+            <div class="queue-item-footer">
+                <div class="queue-stats-text">${statsText}</div>
+                ${job.status === 'downloading' ? `<button class="btn-cancel-dl">Cancel</button>` : ''}
+            </div>
+            ${job.status === 'failed' && job.error ? `<div class="queue-error-msg">${job.error}</div>` : ''}
+        `;
+        
+        if (job.status === 'downloading') {
+            item.querySelector(".btn-cancel-dl").addEventListener("click", () => cancelJob(job.id));
+        }
+        
+        downloadsQueueList.appendChild(item);
+    });
+}
+
+async function cancelJob(id) {
+    if (!confirm("Are you sure you want to cancel this YouTube download job?")) return;
+    try {
+        const res = await apiFetch("/api/youtube/cancel", {
+            method: "POST",
+            body: JSON.stringify({ id }),
+        });
+        const data = await res.json();
+        if (data.success) {
+            fetchActiveDownloads();
+        } else {
+            alert("❌ Failed to cancel download.");
+        }
+    } catch (err) {
+        alert(`❌ Cancellation error: ${err.message}`);
     }
 }

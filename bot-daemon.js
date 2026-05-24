@@ -6,9 +6,13 @@ import si from "systeminformation";
 import config from "./config.js";
 import BaleClient from "./bale-client.js";
 import logger from "./logger.js";
+import { searchYouTube, startDownload, getActiveDownloads } from "./youtube-service.js";
 
 // Cache for mapping chat IDs to their last listed file paths (makes it easy to do /upload 1)
 const lastFileListCache = new Map();
+
+// Cache for active YouTube search results per chat ID to handle bot pagination
+const ytSearchCache = new Map();
 
 // Helper to format bytes to human readable sizes
 function formatBytes(bytes, decimals = 2) {
@@ -108,6 +112,29 @@ async function handleCallbackQuery(client, callbackQuery) {
             await client.answerCallbackQuery(queryId, "📤 در حال آغاز آپلود...").catch(() => {});
             // Execute upload
             await handleUpload(client, chatId, [fileIndexStr]);
+        } else if (data.startsWith("ytpage:")) {
+            const nextPage = parseInt(data.slice(7), 10);
+            await client.answerCallbackQuery(queryId, "🔄 در حال بارگذاری صفحه...").catch(() => {});
+            await sendSearchPage(client, chatId, nextPage, messageId);
+        } else if (data.startsWith("ytsel:")) {
+            const absIndex = parseInt(data.slice(6), 10);
+            await client.answerCallbackQuery(queryId, "ℹ️ در حال دریافت جزئیات ویدیو...").catch(() => {});
+            await sendVideoDetails(client, chatId, absIndex, messageId);
+        } else if (data === "ytback") {
+            await client.answerCallbackQuery(queryId, "🔙 بازگشت به نتایج...").catch(() => {});
+            const cache = ytSearchCache.get(chatId);
+            const lastPage = cache ? cache.page : 0;
+            await sendSearchPage(client, chatId, lastPage, messageId);
+        } else if (data.startsWith("ytdl:")) {
+            const parts = data.split(":");
+            const type = parts[1]; // 'video' or 'audio'
+            const absIndex = parseInt(parts[2], 10);
+            await client.answerCallbackQuery(queryId, "📥 در حال ثبت درخواست دانلود...").catch(() => {});
+            await triggerYoutubeDownload(client, chatId, absIndex, type, messageId);
+        } else if (data.startsWith("up_dl:")) {
+            const jobId = data.slice(6);
+            await client.answerCallbackQuery(queryId, "📤 در حال آغاز آپلود فایل...").catch(() => {});
+            await handleJobUpload(client, chatId, jobId);
         }
     } catch (err) {
         logger.error(`Error processing callback query: ${err.message}`);
@@ -161,6 +188,9 @@ async function handleMessage(client, message) {
             case "/upload":
                 await handleUpload(client, chatId, args);
                 break;
+            case "/search":
+                await handleSearch(client, chatId, args);
+                break;
             default:
                 await client.sendMessage(
                     chatId,
@@ -176,12 +206,13 @@ async function handleMessage(client, message) {
 async function handleHelp(client, chatId) {
     const helpText = `👋 *ربات آپلودر سرور بله*
 
-پوشه دانلودهای سرور خود را با بله همگام نگه دارید. از این دستورات برای بررسی وضعیت سرور و آپلود مستقیم فایل‌ها به این چت استفاده کنید.
+پوشه دانلودهای سرور خود را با بله همگام نگه دارید. از این دستورات برای بررسی وضعیت سرور، جستجو و دانلود از یوتیوب و آپلود فایل‌ها استفاده کنید.
 
 *دستورات در دسترس:*
 • /files - لیست فایل‌ها در پوشه دانلود
 • /files [subdir] - لیست فایل‌ها در یک پوشه فرعی
 • /upload [index/filename] - آپلود یک فایل به این چت
+• /search [query] - جستجو و دانلود ویدیوها از یوتیوب
 • /status - نمایش پردازنده، رم، فضای دیسک سرور و مدت زمان روشن بودن
 • /chatid - نمایش شناسه (Chat ID) این چت
 • /help - نمایش این راهنما
@@ -502,4 +533,246 @@ if (
     startBot().catch((err) => {
         logger.error("Unhandled error starting bot daemon:", err.message);
     });
+}
+
+// YouTube Search handler command
+async function handleSearch(client, chatId, args) {
+    if (args.length === 0) {
+        return client.sendMessage(chatId, "❌ نحوه استفاده: `/search [عبارت جستجو]`", {
+            parse_mode: "Markdown",
+        });
+    }
+
+    const query = args.join(" ").trim();
+    const searchMsg = await client.sendMessage(chatId, "🔍 در حال جستجو در یوتیوب، لطفاً منتظر بمانید...");
+
+    try {
+        const results = await searchYouTube(query);
+        if (!results.videos || results.videos.length === 0) {
+            return client.editMessageText(chatId, searchMsg.message_id, `❌ هیچ ویدیویی برای عبارت "${query}" یافت نشد.`);
+        }
+
+        // Save active query and search results in cache
+        ytSearchCache.set(chatId, {
+            query,
+            videos: results.videos,
+            page: 0
+        });
+
+        await sendSearchPage(client, chatId, 0, searchMsg.message_id);
+    } catch (err) {
+        logger.error(`YouTube search failed: ${err.message}`);
+        await client.editMessageText(chatId, searchMsg.message_id, `❌ خطای سیستم در حین جستجو: ${err.message}`);
+    }
+}
+
+// Send paginated YouTube search results
+async function sendSearchPage(client, chatId, page, editMessageId = null) {
+    const cache = ytSearchCache.get(chatId);
+    if (!cache) {
+        return client.sendMessage(chatId, "❌ هیچ جستجوی فعالی یافت نشد. مجدداً دستور `/search` را بفرستید.");
+    }
+
+    // Update active page
+    cache.page = page;
+    ytSearchCache.set(chatId, cache);
+
+    const videos = cache.videos;
+    const itemsPerPage = 5;
+    const totalPages = Math.ceil(videos.length / itemsPerPage);
+    const startIdx = page * itemsPerPage;
+    const pageVideos = videos.slice(startIdx, startIdx + itemsPerPage);
+
+    let text = `🔍 *نتایج جستجوی یوتیوب برای:* "${cache.query}"\n`;
+    text += `صفحه *${page + 1}* از *${totalPages}*\n\n`;
+
+    const numberEmojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"];
+    const keyboard = [];
+    const selectionRow = [];
+
+    pageVideos.forEach((video, index) => {
+        const absoluteIndex = startIdx + index;
+        text += `${numberEmojis[index]} *${video.title}*\n`;
+        text += `⏱️ زمان: ${video.duration ? video.duration.timestamp : (video.timestamp || "نامشخص")} | 👤 کانال: ${video.author ? video.author.name : "نامشخص"}\n\n`;
+
+        selectionRow.push({
+            text: numberEmojis[index],
+            callback_data: `ytsel:${absoluteIndex}`
+        });
+    });
+
+    keyboard.push(selectionRow);
+
+    // Pagination Row
+    const paginationRow = [];
+    if (page > 0) {
+        paginationRow.push({
+            text: "◀️ قبلی",
+            callback_data: `ytpage:${page - 1}`
+        });
+    }
+    if (page < totalPages - 1) {
+        paginationRow.push({
+            text: "بعدی ▶️",
+            callback_data: `ytpage:${page + 1}`
+        });
+    }
+
+    if (paginationRow.length > 0) {
+        keyboard.push(paginationRow);
+    }
+
+    if (editMessageId) {
+        try {
+            await client.editMessageText(chatId, editMessageId, text, {
+                parse_mode: "Markdown",
+                reply_markup: { inline_keyboard: keyboard }
+            });
+            return;
+        } catch (err) {
+            // fallback if edit fails
+        }
+    }
+
+    await client.sendMessage(chatId, text, {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: keyboard }
+    });
+}
+
+// Send detailed video card inside chat
+async function sendVideoDetails(client, chatId, absIndex, editMessageId) {
+    const cache = ytSearchCache.get(chatId);
+    if (!cache || !cache.videos[absIndex]) {
+        return client.sendMessage(chatId, "❌ ویدیوی انتخاب شده در حافظه موقت یافت نشد.");
+    }
+
+    const video = cache.videos[absIndex];
+    const text = `🎥 *جزئیات ویدیو:*
+
+📌 *عنوان:* \`${video.title}\`
+👤 *کانال:* \`${video.author ? video.author.name : "نامشخص"}\`
+⏱️ *مدت زمان:* ${video.duration ? video.duration.timestamp : (video.timestamp || "نامشخص")}
+👁️ *تعداد بازدید:* ${video.views ? video.views.toLocaleString() : "نامشخص"}
+🔗 *لینک:* ${video.url}
+
+📥 *لطفاً فرمت دانلود به سرور را انتخاب کنید:*`;
+
+    const keyboard = [
+        [
+            { text: "🎥 دانلود ویدیو (MP4)", callback_data: `ytdl:video:${absIndex}` },
+            { text: "🎵 دانلود صوتی (MP3)", callback_data: `ytdl:audio:${absIndex}` }
+        ],
+        [
+            { text: "🔙 بازگشت به لیست نتایج", callback_data: "ytback" }
+        ]
+    ];
+
+    await client.editMessageText(chatId, editMessageId, text, {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: keyboard }
+    });
+}
+
+// Trigger background download and register callbacks
+async function triggerYoutubeDownload(client, chatId, absIndex, type, editMessageId) {
+    const cache = ytSearchCache.get(chatId);
+    if (!cache || !cache.videos[absIndex]) {
+        return client.sendMessage(chatId, "❌ ویدیوی انتخاب شده یافت نشد.");
+    }
+
+    const video = cache.videos[absIndex];
+    const typeLabel = type === "video" ? "ویدیو (MP4)" : "صدا (MP3)";
+
+    await client.editMessageText(chatId, editMessageId, `📥 دانلود ${typeLabel} به سرور آغاز شد:\n\`${video.title}\`\n\nپس از اتمام دانلود و ذخیره روی سرور، پیامی حاوی دکمه آپلود دریافت خواهید کرد.`, {
+        parse_mode: "Markdown"
+    });
+
+    try {
+        startDownload(video.url, type, (job) => {
+            // onComplete callback
+            sendDownloadNotification(client, chatId, job).catch(err => {
+                logger.error(`Failed to send completed download notification: ${err.message}`);
+            });
+        }, (job, error) => {
+            // onError callback
+            sendDownloadErrorNotification(client, chatId, job, error).catch(err => {
+                logger.error(`Failed to send failed download notification: ${err.message}`);
+            });
+        });
+    } catch (err) {
+        logger.error(`yt-dlp download spawn failed: ${err.message}`);
+        await client.sendMessage(chatId, `❌ شروع فرآیند دانلود با خطا مواجه شد: ${err.message}`);
+    }
+}
+
+// Notify user in chat when background download successfully completes
+async function sendDownloadNotification(client, chatId, job) {
+    const filename = job.outputFile ? path.basename(job.outputFile) : "file";
+    const sizeStr = job.outputFile && fs.existsSync(job.outputFile)
+        ? formatBytes(fs.statSync(job.outputFile).size)
+        : "--";
+
+    const text = `✅ *دانلود از یوتیوب با موفقیت به پایان رسید!*
+
+📄 *نام فایل:* \`${filename}\`
+💾 *حجم فایل:* ${sizeStr}
+
+📥 برای آپلود مستقیم این فایل به چت بله، دکمه زیر را فشار دهید:`;
+
+    const keyboard = [
+        [{ text: "📤 آپلود به بله", callback_data: `up_dl:${job.id}` }]
+    ];
+
+    await client.sendMessage(chatId, text, {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: keyboard }
+    });
+}
+
+// Notify user in chat when download fails
+async function sendDownloadErrorNotification(client, chatId, job, error) {
+    const title = job.title || "ویدیو";
+    const text = `❌ *دانلود از یوتیوب ناموفق بود!*
+
+📌 *عنوان ویدیو:* \`${title}\`
+⚠️ *خطا:* \`${error || "خطای ناشناخته در حین دانلود"}\``;
+
+    await client.sendMessage(chatId, text, {
+        parse_mode: "Markdown"
+    });
+}
+
+// Handle upload of downloaded files via short session ID references
+async function handleJobUpload(client, chatId, jobId) {
+    const downloads = getActiveDownloads();
+    const job = downloads.find(d => d.id === jobId);
+
+    if (!job || !job.outputFile || !fs.existsSync(job.outputFile)) {
+        return client.sendMessage(chatId, "❌ فایل مورد نظر روی سرور یافت نشد. ممکن است فایل حذف شده باشد.");
+    }
+
+    const filename = path.basename(job.outputFile);
+    const statusMsg = await client.sendMessage(chatId, `📤 در حال آپلود فایل \`${filename}\` از سرور به بله...`, {
+        parse_mode: "Markdown",
+    });
+
+    try {
+        const uploadStartTime = Date.now();
+        // Trigger split upload automatically if files exceed the max limit!
+        await client.sendFile(chatId, job.outputFile, `آپلود شده: ${filename}`);
+        const elapsed = ((Date.now() - uploadStartTime) / 1000).toFixed(1);
+
+        logger.success(`Job upload completed: ${filename} in ${elapsed}s`);
+        await client.sendMessage(chatId, `✅ *آپلود فایل با موفقیت انجام شد!* فایل \`${filename}\` در ${elapsed} ثانیه ارسال شد.`, {
+            parse_mode: "Markdown",
+            reply_to_message_id: statusMsg.message_id
+        });
+    } catch (err) {
+        logger.error(`Job upload failed for ${filename}: ${err.message}`);
+        await client.sendMessage(chatId, `❌ *آپلود ناموفق بود:* ${err.message}`, {
+            parse_mode: "Markdown",
+            reply_to_message_id: statusMsg.message_id
+        });
+    }
 }

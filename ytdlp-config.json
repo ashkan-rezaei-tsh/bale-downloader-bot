@@ -1,0 +1,10 @@
+{
+  "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+  "audioFormat": "mp3",
+  "audioQuality": "5",
+  "outtmpl": "%(title)s [%(id)s].%(ext)s",
+  "extraArgs": [
+    "--no-playlist",
+    "--no-mtime"
+  ]
+}
