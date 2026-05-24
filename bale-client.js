@@ -299,6 +299,29 @@ The file *${fileName}* exceeded the upload limit and was sent in *${totalChunks}
       console.log(`[BALE CLIENT] Temporary zip and chunk files successfully deleted from server.`);
     }
   }
+
+  /**
+   * Answer a callback query from an inline button press
+   */
+  async answerCallbackQuery(callbackQueryId, text = '', showAlert = false) {
+    return this.request('answerCallbackQuery', {
+      callback_query_id: String(callbackQueryId),
+      text,
+      show_alert: showAlert
+    });
+  }
+
+  /**
+   * Edit a message's text and markup inline
+   */
+  async editMessageText(chatId, messageId, text, options = {}) {
+    return this.request('editMessageText', {
+      chat_id: String(chatId),
+      message_id: Number(messageId),
+      text,
+      ...options
+    });
+  }
 }
 
 export default BaleClient;

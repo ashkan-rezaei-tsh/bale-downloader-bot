@@ -69,6 +69,11 @@ export async function startBot() {
                     handleMessage(client, update.message).catch((err) => {
                         logger.error(`Error handling message: ${err.message}`, err.stack);
                     });
+                } else if (update.callback_query) {
+                    // Handle callback queries from inline buttons
+                    handleCallbackQuery(client, update.callback_query).catch((err) => {
+                        logger.error(`Error handling callback query: ${err.message}`, err.stack);
+                    });
                 }
             }
         } catch (err) {
@@ -76,6 +81,37 @@ export async function startBot() {
             // Wait 5 seconds before attempting to poll again to avoid spamming Bale servers
             await new Promise((resolve) => setTimeout(resolve, 5000));
         }
+    }
+}
+
+async function handleCallbackQuery(client, callbackQuery) {
+    const queryId = callbackQuery.id;
+    const chatId = callbackQuery.message.chat.id;
+    const messageId = callbackQuery.message.message_id;
+    const data = callbackQuery.data;
+
+    // Check authorization
+    if (!config.isChatAllowed(chatId)) {
+        logger.warn(`Unauthorized callback query from Chat ID: ${chatId}`);
+        return client.answerCallbackQuery(queryId, "❌ دسترسی غیرمجاز", true).catch(() => {});
+    }
+
+    try {
+        if (data.startsWith("dir:")) {
+            const targetSubDir = data.slice(4);
+            // Answer the callback query to clear the loading spinner
+            await client.answerCallbackQuery(queryId, "📁 در حال بروزرسانی لیست...").catch(() => {});
+            // Reload files in-place by editing the message
+            await handleFiles(client, chatId, targetSubDir ? [targetSubDir] : [], messageId);
+        } else if (data.startsWith("up:")) {
+            const fileIndexStr = data.slice(3);
+            await client.answerCallbackQuery(queryId, "📤 در حال آغاز آپلود...").catch(() => {});
+            // Execute upload
+            await handleUpload(client, chatId, [fileIndexStr]);
+        }
+    } catch (err) {
+        logger.error(`Error processing callback query: ${err.message}`);
+        await client.sendMessage(chatId, `❌ خطا در پردازش کلید: ${err.message}`).catch(() => {});
     }
 }
 
@@ -206,15 +242,15 @@ async function handleStatus(client, chatId) {
     }
 }
 
-async function handleFiles(client, chatId, args) {
+async function handleFiles(client, chatId, args, editMessageId = null) {
     const subDir = args.join(" ").trim();
     const targetDir = subDir ? path.resolve(config.downloadsDir, subDir) : config.downloadsDir;
 
     // Security check: ensure target directory is within config.downloadsDir
     const relative = path.relative(config.downloadsDir, targetDir);
-    const isSafe = !relative.startsWith("..") && !path.isAbsolute(relative);
+    const isSafe = targetDir === config.downloadsDir || (!relative.startsWith("..") && !path.isAbsolute(relative));
 
-    if (targetDir !== config.downloadsDir && !isSafe) {
+    if (!isSafe) {
         return client.sendMessage(chatId, "❌ نقض امنیتی: دسترسی به پوشه رد شد.");
     }
 
@@ -260,8 +296,28 @@ async function handleFiles(client, chatId, args) {
     });
 
     if (items.length === 0) {
-        return client.sendMessage(chatId, `📁 پوشه خالی است: \`${path.basename(targetDir)}\``, {
+        const emptyMsg = `📁 پوشه خالی است: \`${path.basename(targetDir)}\``;
+        const emptyKeyboard = [];
+        if (subDir) {
+            const parentDir = path.dirname(subDir);
+            const parentData = parentDir === "." || parentDir === "/" || parentDir === "" ? "dir:" : `dir:${parentDir.replace(/\\/g, "/")}`;
+            emptyKeyboard.push([{ text: "🔙 بازگشت به پوشه قبل", callback_data: parentData }]);
+        }
+        
+        if (editMessageId) {
+            try {
+                await client.editMessageText(chatId, editMessageId, emptyMsg, {
+                    parse_mode: "Markdown",
+                    reply_markup: { inline_keyboard: emptyKeyboard }
+                });
+                return;
+            } catch (err) {
+                // Fallback
+            }
+        }
+        return client.sendMessage(chatId, emptyMsg, {
             parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: emptyKeyboard }
         });
     }
 
@@ -283,9 +339,75 @@ async function handleFiles(client, chatId, args) {
 
     response += `\n*برای آپلود فایل، دستور زیر را ارسال کنید:*\n`;
     response += `\`/upload [index]\` (به عنوان مثال \`/upload 1\`)\n`;
-    response += `یا \`/upload [filename]\` (به عنوان مثال \`/upload ${items.find((i) => !i.isDir)?.name || "file.mp4"}\`)`;
+    response += `یا از دکمه‌های زیر برای انتخاب سریع استفاده کنید:`;
 
-    await client.sendMessage(chatId, response, { parse_mode: "Markdown" });
+    // Construct Inline Keyboard
+    const keyboard = [];
+    let row = [];
+
+    // Folder buttons: 2 per row
+    const dirItems = items.filter((i) => i.isDir);
+    for (let i = 0; i < dirItems.length; i++) {
+        const item = dirItems[i];
+        const relPath = path.relative(config.downloadsDir, item.path).replace(/\\/g, "/");
+        row.push({
+            text: `📁 ${item.name}`,
+            callback_data: `dir:${relPath}`
+        });
+        if (row.length === 2 || i === dirItems.length - 1) {
+            keyboard.push(row);
+            row = [];
+        }
+    }
+
+    // File buttons: 1 per row (since filenames can be long)
+    const fileItems = items.filter((i) => !i.isDir);
+    let inlineFileIndex = 1;
+    for (let i = 0; i < fileItems.length; i++) {
+        const item = fileItems[i];
+        const truncatedName = item.name.length > 25 ? item.name.slice(0, 22) + "..." : item.name;
+        keyboard.push([
+            {
+                text: `📤 ${inlineFileIndex}. ${truncatedName} (${formatBytes(item.size)})`,
+                callback_data: `up:${inlineFileIndex}`
+            }
+        ]);
+        inlineFileIndex++;
+    }
+
+    // Back button if in a subdirectory
+    if (subDir) {
+        const parentDir = path.dirname(subDir);
+        const parentData = parentDir === "." || parentDir === "/" || parentDir === "" ? "dir:" : `dir:${parentDir.replace(/\\/g, "/")}`;
+        keyboard.push([
+            {
+                text: "🔙 بازگشت به پوشه قبل",
+                callback_data: parentData
+            }
+        ]);
+    }
+
+    // Send or Edit Message
+    if (editMessageId) {
+        try {
+            await client.editMessageText(chatId, editMessageId, response, {
+                parse_mode: "Markdown",
+                reply_markup: {
+                    inline_keyboard: keyboard
+                }
+            });
+            return;
+        } catch (err) {
+            logger.warn(`Failed to edit message in-place, sending a new message: ${err.message}`);
+        }
+    }
+
+    await client.sendMessage(chatId, response, {
+        parse_mode: "Markdown",
+        reply_markup: {
+            inline_keyboard: keyboard
+        }
+    });
 }
 
 async function handleUpload(client, chatId, args) {
