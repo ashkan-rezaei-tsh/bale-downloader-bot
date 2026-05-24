@@ -42,6 +42,20 @@ if (!fs.existsSync(tempDir)) {
     } catch (err) {
         console.error(`Failed to create temp directory at ${tempDir}:`, err.message);
     }
+} else {
+    // Clear temp files on startup to prevent storage leaks from previous crashed/interrupted runs
+    try {
+        const files = fs.readdirSync(tempDir);
+        for (const file of files) {
+            const filePath = path.join(tempDir, file);
+            if (fs.statSync(filePath).isFile()) {
+                fs.unlinkSync(filePath);
+            }
+        }
+        console.log(`Cleared temporary uploads folder on startup: ${tempDir}`);
+    } catch (err) {
+        console.error(`Failed to empty temp directory on startup:`, err.message);
+    }
 }
 
 // Parse allowed chat IDs

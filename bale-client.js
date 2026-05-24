@@ -37,6 +37,9 @@ function sanitizeHeaderFilename(filename) {
     .replace(/[;"]/g, '_');         // Replace characters that can break header parsing
 }
 
+// Singleton cache to retain upload session state for resuming failed multi-part uploads
+const uploadSessions = new Map();
+
 export class BaleClient {
   constructor(token) {
     if (!token) {
@@ -205,57 +208,91 @@ export class BaleClient {
   }
 
   /**
-   * Zip and split large files, uploading the chunks sequentially with merging instructions
+   * Zip and split large files, uploading the chunks sequentially with merging instructions.
+   * Tracks progress in an in-memory session cache to allow resuming from where the error occurred.
    */
   async uploadLargeFile(chatId, filePath, caption = '') {
     const fileStats = fs.statSync(filePath);
     const fileName = path.basename(filePath);
     const ext = path.extname(filePath).toLowerCase();
     
-    let fileToSplit = filePath;
+    // Create a unique upload key for this chat and file combination based on path, size, and modification time
+    const uploadKey = `${chatId}:${filePath}:${fileStats.size}:${fileStats.mtime.getTime()}`;
+    
+    let session = uploadSessions.get(uploadKey);
+    let chunks = [];
     let isTempZipCreated = false;
     let zipPath = '';
+    let startIndex = 0;
+    let uploadedMessageIds = [];
 
-    // Step 1: Zip the file if it's not already a compressed archive
-    if (ext === '.zip' || ext === '.rar' || ext === '.gz' || ext === '.7z') {
-      fileToSplit = filePath;
-    } else {
-      const tempZipName = `${path.basename(filePath, ext)}_${Date.now()}.zip`;
-      zipPath = path.join(config.tempDir, tempZipName);
-      
-      console.log(`[BALE CLIENT] Compressing large file: ${fileName} -> ${tempZipName}`);
-      try {
-        await zipFile(filePath, zipPath);
-        fileToSplit = zipPath;
-        isTempZipCreated = true;
-      } catch (err) {
-        console.error(`[BALE CLIENT] Compression failed, falling back to raw binary split:`, err.message);
-        fileToSplit = filePath; // Fallback to raw binary split if zipping fails
+    // Verify existing session chunks are still present on disk
+    if (session) {
+      const allChunksExist = session.chunks.every(chunkPath => fs.existsSync(chunkPath));
+      if (allChunksExist) {
+        chunks = session.chunks;
+        isTempZipCreated = session.isTempZipCreated;
+        zipPath = session.zipPath;
+        startIndex = session.uploadedCount;
+        uploadedMessageIds = session.uploadedMessageIds;
+        console.log(`[BALE CLIENT] Resuming failed upload session. Starting from chunk ${startIndex + 1}/${chunks.length}`);
+      } else {
+        console.log(`[BALE CLIENT] Temp files missing for existing session. Re-initiating split upload...`);
+        uploadSessions.delete(uploadKey);
+        session = null;
       }
     }
 
-    const sizeToSplit = fs.statSync(fileToSplit).size;
-    const readableChunkSize = (config.uploadMaxSize / (1024 * 1024)).toFixed(1);
-    console.log(`[BALE CLIENT] Splitting file into chunks of size ${readableChunkSize}MB: ${path.basename(fileToSplit)}`);
-    
-    let chunks = [];
-    try {
-      // Step 2: Split the file in config.tempDir
-      chunks = await splitFile(fileToSplit, config.uploadMaxSize, config.tempDir);
-    } catch (err) {
-      if (isTempZipCreated) cleanupFiles([zipPath]);
-      throw new Error(`Failed to split file: ${err.message}`);
+    // Initiate new session if none exists or it was deleted
+    if (!session) {
+      let fileToSplit = filePath;
+
+      // Step 1: Zip the file if it's not already a compressed archive
+      if (ext === '.zip' || ext === '.rar' || ext === '.gz' || ext === '.7z') {
+        fileToSplit = filePath;
+      } else {
+        const tempZipName = `${path.basename(filePath, ext)}_${Date.now()}.zip`;
+        zipPath = path.join(config.tempDir, tempZipName);
+        
+        console.log(`[BALE CLIENT] Compressing large file: ${fileName} -> ${tempZipName}`);
+        try {
+          await zipFile(filePath, zipPath);
+          fileToSplit = zipPath;
+          isTempZipCreated = true;
+        } catch (err) {
+          console.error(`[BALE CLIENT] Compression failed, falling back to raw binary split:`, err.message);
+          fileToSplit = filePath; // Fallback to raw binary split if zipping fails
+        }
+      }
+
+      const sizeToSplit = fs.statSync(fileToSplit).size;
+      const readableChunkSize = (config.uploadMaxSize / (1024 * 1024)).toFixed(1);
+      console.log(`[BALE CLIENT] Splitting file into chunks of size ${readableChunkSize}MB: ${path.basename(fileToSplit)}`);
+      
+      try {
+        // Step 2: Split the file in config.tempDir
+        chunks = await splitFile(fileToSplit, config.uploadMaxSize, config.tempDir);
+      } catch (err) {
+        if (isTempZipCreated) cleanupFiles([zipPath]);
+        throw new Error(`Failed to split file: ${err.message}`);
+      }
+
+      session = {
+        zipPath,
+        isTempZipCreated,
+        chunks,
+        uploadedCount: 0,
+        uploadedMessageIds: []
+      };
+      uploadSessions.set(uploadKey, session);
     }
 
     const totalChunks = chunks.length;
-    console.log(`[BALE CLIENT] Split complete: ${totalChunks} parts. Uploading sequentially...`);
-
-    const uploadedMessageIds = [];
-    const baseNameOfFile = path.basename(fileToSplit);
+    const baseNameOfFile = path.basename(isTempZipCreated ? zipPath : filePath);
 
     try {
-      // Step 3: Upload chunks sequentially
-      for (let i = 0; i < totalChunks; i++) {
+      // Step 3: Upload chunks sequentially starting from the last successful index
+      for (let i = startIndex; i < totalChunks; i++) {
         const chunkPath = chunks[i];
         const chunkName = path.basename(chunkPath);
         
@@ -263,7 +300,12 @@ export class BaleClient {
         
         // Pass disableSplit = true to avoid infinite recursion
         const result = await this.sendDocument(chatId, chunkPath, `Part ${i + 1}/${totalChunks}: ${chunkName}`, {}, true);
+        
+        // Record progress in cache
         uploadedMessageIds.push(result.message_id);
+        session.uploadedCount = i + 1;
+        session.uploadedMessageIds = uploadedMessageIds;
+        uploadSessions.set(uploadKey, session);
         
         // Respect rate limits between sequential API calls
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -288,15 +330,19 @@ The file *${fileName}* exceeded the upload limit and was sent in *${totalChunks}
       const finalMsg = await this.sendMessage(chatId, extractionInstructions, { parse_mode: 'Markdown' });
       uploadedMessageIds.push(finalMsg.message_id);
 
-      return { message_id: uploadedMessageIds[0], all_message_ids: uploadedMessageIds };
-    } finally {
-      // Step 5: Clean up all temp files
+      // Clean up files and remove session on absolute success
       const filesToCleanup = [...chunks];
       if (isTempZipCreated) {
         filesToCleanup.push(zipPath);
       }
       cleanupFiles(filesToCleanup);
-      console.log(`[BALE CLIENT] Temporary zip and chunk files successfully deleted from server.`);
+      uploadSessions.delete(uploadKey);
+      console.log(`[BALE CLIENT] Temporary files cleaned up and session removed.`);
+
+      return { message_id: uploadedMessageIds[0], all_message_ids: uploadedMessageIds };
+    } catch (err) {
+      console.error(`[BALE CLIENT] Error occurred at chunk ${session.uploadedCount + 1}/${totalChunks}. Session saved for resumption.`);
+      throw err; // Propagate error so bot/dashboard knows it failed, but do NOT delete session or temp files!
     }
   }
 
