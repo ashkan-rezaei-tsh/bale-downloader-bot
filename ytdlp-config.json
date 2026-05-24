@@ -5,6 +5,8 @@
   "outtmpl": "%(title)s [%(id)s].%(ext)s",
   "extraArgs": [
     "--no-playlist",
-    "--no-mtime"
+    "--no-mtime",
+    "--js-runtime",
+    "node"
   ]
 }
