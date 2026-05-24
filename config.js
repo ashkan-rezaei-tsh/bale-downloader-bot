@@ -32,6 +32,18 @@ if (!fs.existsSync(downloadsDir)) {
     }
 }
 
+// Resolve and verify temp directory
+let tempDir = path.join(__dirname, "temp");
+tempDir = path.resolve(tempDir);
+
+if (!fs.existsSync(tempDir)) {
+    try {
+        fs.mkdirSync(tempDir, { recursive: true });
+    } catch (err) {
+        console.error(`Failed to create temp directory at ${tempDir}:`, err.message);
+    }
+}
+
 // Parse allowed chat IDs
 const allowedChatIdsStr = process.env.ALLOWED_CHAT_IDS || "";
 const allowedChatIds = allowedChatIdsStr
@@ -54,6 +66,8 @@ export const config = {
     token,
     isPlaceholderToken,
     downloadsDir,
+    tempDir,
+    uploadMaxSize: parseInt(process.env.UPLOAD_MAX_SIZE_MB || "19", 10) * 1024 * 1024,
     defaultChatId: process.env.DEFAULT_CHAT_ID || "",
     allowedChatIds,
     port: parseInt(process.env.PORT || "3000", 10),
