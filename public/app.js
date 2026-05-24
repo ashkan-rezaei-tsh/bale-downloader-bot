@@ -495,15 +495,16 @@ async function handleUploadSubmit(e) {
     }
 
     // Close upload config dialog and show loading box
+    const fileToUpload = activeUploadFile;
     hideModal();
-    loadingOverlayFilename.innerText = activeUploadFile.name;
+    loadingOverlayFilename.innerText = fileToUpload.name;
     loadingOverlay.classList.remove("hidden");
 
     try {
         const res = await apiFetch("/api/upload", {
             method: "POST",
             body: JSON.stringify({
-                relativePath: activeUploadFile.relativePath,
+                relativePath: fileToUpload.relativePath,
                 chatId,
                 caption,
                 type,

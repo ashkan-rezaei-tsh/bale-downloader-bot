@@ -231,6 +231,7 @@ async function handleFiles(client, chatId, args) {
     const items = [];
 
     for (const filename of files) {
+        if (config.ignoredFiles.has(filename)) continue;
         const filePath = path.join(targetDir, filename);
         const stats = fs.statSync(filePath);
 

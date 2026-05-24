@@ -41,6 +41,15 @@ const allowedChatIds = allowedChatIdsStr
           .filter((id) => id !== "")
     : [];
 
+// Parse ignored files
+const ignoredFilesStr = process.env.IGNORE_FILES || "cookies.txt,yt-dlp.conf,yt-dlp_linux";
+const ignoredFiles = new Set(
+    ignoredFilesStr
+        .split(",")
+        .map((f) => f.trim())
+        .filter((f) => f !== ""),
+);
+
 export const config = {
     token,
     isPlaceholderToken,
@@ -49,6 +58,7 @@ export const config = {
     allowedChatIds,
     port: parseInt(process.env.PORT || "3000", 10),
     dashboardPassword: process.env.DASHBOARD_PASSWORD || "admin",
+    ignoredFiles,
     isChatAllowed(chatId) {
         if (this.allowedChatIds.length === 0) return true; // Whitelist empty = allow all
         return this.allowedChatIds.includes(String(chatId));
