@@ -456,6 +456,19 @@ async function fetchFiles(dir) {
                     openUploadModal(file, isVideo);
                 });
                 actionsTd.appendChild(sendBtn);
+
+                // Add Download Button
+                const downloadBtn = document.createElement("button");
+                downloadBtn.className = "btn-action-download";
+                downloadBtn.title = "Download file to your local device";
+                downloadBtn.innerHTML = `
+          <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+          <span>Download</span>
+        `;
+                downloadBtn.addEventListener("click", () => {
+                    downloadFile(file);
+                });
+                actionsTd.appendChild(downloadBtn);
             }
 
             // Safe Deletion action for files/directories
@@ -819,5 +832,28 @@ async function cancelJob(id) {
         }
     } catch (err) {
         alert(`❌ Cancellation error: ${err.message}`);
+    }
+}
+
+async function downloadFile(file) {
+    try {
+        const res = await apiFetch("/api/files/sign", {
+            method: "POST",
+            body: JSON.stringify({ relativePath: file.relativePath }),
+        });
+        const data = await res.json();
+        if (data.success && data.downloadUrl) {
+            // Trigger browser download using a temporary link
+            const a = document.createElement("a");
+            a.href = data.downloadUrl;
+            a.download = file.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        } else {
+            alert(`❌ Failed to generate download link: ${data.error || "Unknown error"}`);
+        }
+    } catch (err) {
+        alert(`❌ Download error: ${err.message}`);
     }
 }

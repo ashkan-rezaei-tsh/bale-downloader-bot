@@ -771,6 +771,25 @@ button {
   border-color: transparent;
 }
 
+.btn-action-download {
+  background: var(--accent-blue-glow);
+  color: var(--accent-blue);
+  border: 1px solid rgba(59, 130, 246, 0.2);
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all var(--transition-fast);
+  margin-left: 6px;
+}
+.btn-action-download:hover {
+  background: var(--accent-blue);
+  color: #fff;
+  border-color: transparent;
+}
+
 .btn-action-delete {
   background: rgba(239, 68, 68, 0.08);
   color: var(--danger);
@@ -1255,7 +1274,7 @@ button {
     width: 100%;
     justify-content: center;
   }
-  .btn-action-send span {
+  .btn-action-send span, .btn-action-download span {
     display: none;
   }
   .files-table th.col-date, .files-table td:nth-child(3) {

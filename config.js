@@ -87,6 +87,7 @@ export const config = {
     port: parseInt(process.env.PORT || "3000", 10),
     dashboardPassword: process.env.DASHBOARD_PASSWORD || "admin",
     ignoredFiles,
+    downloadLinkExpiry: process.env.DOWNLOAD_LINK_EXPIRY || "1h",
     isChatAllowed(chatId) {
         if (this.allowedChatIds.length === 0) return true; // Whitelist empty = allow all
         return this.allowedChatIds.includes(String(chatId));

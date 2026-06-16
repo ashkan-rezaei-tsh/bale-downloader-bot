@@ -222,6 +222,92 @@ app.post('/api/files/delete', authMiddleware, (req, res) => {
 });
 
 /**
+ * Generate a signed temporary download link for a file
+ */
+app.post('/api/files/sign', authMiddleware, (req, res) => {
+  const { relativePath } = req.body;
+
+  if (!relativePath) {
+    return res.status(400).json({ error: 'Missing relativePath parameter' });
+  }
+
+  const resolvedPath = path.resolve(config.downloadsDir, relativePath);
+  
+  // Security check: ensure path stays within config.downloadsDir
+  const relative = path.relative(config.downloadsDir, resolvedPath);
+  const isSafe = !relative.startsWith('..') && !path.isAbsolute(relative);
+
+  if (!isSafe) {
+    return res.status(403).json({ error: 'Access Denied: Path traversal is forbidden' });
+  }
+
+  if (!fs.existsSync(resolvedPath) || fs.statSync(resolvedPath).isDirectory()) {
+    return res.status(404).json({ error: 'File not found on server' });
+  }
+
+  try {
+    // Generate a temporary JWT download token containing the file path
+    const downloadToken = jwt.sign(
+      { path: relativePath, type: 'download' },
+      jwtSecret,
+      { expiresIn: config.downloadLinkExpiry }
+    );
+
+    const downloadUrl = `/api/files/download?token=${encodeURIComponent(downloadToken)}`;
+    res.json({ success: true, downloadUrl });
+  } catch (err) {
+    logger.error(`Failed to generate download signature: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Public endpoint to download a file using a signed token.
+ * Supports range requests (206 Partial Content) out of the box.
+ */
+app.get('/api/files/download', (req, res) => {
+  const { token } = req.query;
+
+  if (!token) {
+    return res.status(400).json({ error: 'Missing token parameter' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, jwtSecret);
+    
+    if (decoded.type !== 'download' || !decoded.path) {
+      return res.status(403).json({ error: 'Invalid download token' });
+    }
+
+    const resolvedPath = path.resolve(config.downloadsDir, decoded.path);
+    
+    // Security check: ensure path stays within config.downloadsDir
+    const relative = path.relative(config.downloadsDir, resolvedPath);
+    const isSafe = !relative.startsWith('..') && !path.isAbsolute(relative);
+
+    if (!isSafe) {
+      return res.status(403).json({ error: 'Access Denied: Path traversal is forbidden' });
+    }
+
+    if (!fs.existsSync(resolvedPath) || fs.statSync(resolvedPath).isDirectory()) {
+      return res.status(404).json({ error: 'File not found on server' });
+    }
+
+    const filename = path.basename(resolvedPath);
+    
+    // Set attachment content disposition to force file download in browsers
+    // We encode the filename safely to support UTF-8 characters
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+    
+    // Serve the file. res.sendFile handles range queries automatically.
+    res.sendFile(resolvedPath);
+  } catch (err) {
+    logger.error(`Download request failed validation: ${err.message}`);
+    return res.status(403).json({ error: 'Invalid or expired download link' });
+  }
+});
+
+/**
  * Upload a local server file to Bale Chat
  */
 app.post('/api/upload', authMiddleware, async (req, res) => {
